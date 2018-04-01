@@ -1,0 +1,446 @@
+###############################################
+#      nba winning team prediction 2018       #
+###############################################
+
+
+```{r setting, include=FALSE}
+rm(list=ls())
+library = c("dplyr", "mlr", "randomForest", "openxlsx", "inTrees","naivebayes", "gbm", "smbinning", "DMwR", "ggplot2", "xgboost", "caret", "data.table")
+lapply(library,require, character.only=TRUE, quiet = TRUE)
+set.seed(2017)
+
+
+```
+
+```{r, message=FALSE, warning=FALSE, results='hide', include=FALSE}
+
+source('Raw Data Web Scraping Code.R')
+```
+
+```{r data load, include=FALSE, results='hide'}
+
+
+ref = read.xlsx("nba.xlsx", sheet= 'Ref', colNames=TRUE,na.strings = c("NA", ""))
+
+nba = read.xlsx("nba.xlsx", sheet='Raw', colNames=TRUE,na.strings=c("NA", ""))
+nba$id = 1:nrow(nba)
+
+stat16 = read.xlsx("nba.xlsx", sheet ='2016', colNames=TRUE, na.strings=c("NA",""))
+
+
+merged1 =  merge(nba, stat16, by.x='Team1', by.y = 'TEAM_AB', all.x=TRUE, suffixes = c("", ".1"))
+
+merged2 = merge(merged1, stat16, by.x='Team2', by.y = 'TEAM_AB', all.x=TRUE, suffixes = c(".1", ".2"))
+
+nba = merged2[order(merged2$id),]
+
+chr = sapply(nba,class)=='character'
+nba[,chr] = lapply(nba[,chr],as.factor)
+
+ref = read.xlsx("nba.xlsx", sheet= 'Ref', colNames=TRUE,
+                na.strings = c("NA", ""))
+
+nba = select(nba, -TEAM.1, -TEAM.2)
+
+team = select(nba, Team1, Team2, Home, Favorite, Antipublic,Winpred,Gamewin)
+
+for (i in names(team))
+{
+  print(i)
+levels(nba[,i]) = union(levels(nba[,i]),levels(as.factor(ref$Team)))
+}
+
+train = filter(nba, DataType== "Train")
+
+test = filter(nba, DataType =="Test")
+
+testchr = sapply(test,class)=='character'
+test[,testchr] = lapply(test[,testchr],as.factor)
+
+for (i in names(testchr))
+{
+  print(i)
+levels(test[,i]) = union(levels(test[,i]), levels(train[,i]))
+}
+
+```
+
+```{r mlr input data manipulation, message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+
+source("mlr_inputdata.R")
+
+```
+
+
+```{r naive bayes classifier, include=FALSE, results='hide'}
+#example
+#data(iris)
+#m <- naive_bayes(Species ~ ., data = iris)
+#predict(m)
+
+train.nb = train_classif
+
+test.nb =  test_classif
+
+
+nb.model = naive_bayes(GamewinTeam~., drop.unused.levels=TRUE,data = train.nb)
+pred.nb=predict(nb.model, newdata=test.nb)
+pred.nb
+
+
+#predict.lm and predict.glm being an option within predict S3 method, specified to a particular object class
+```
+
+
+```{r logistic model, include=FALSE, results='hide'}
+
+logistic.learner = makeLearner("classif.logreg", 
+                               predict.type = 'prob',
+                               fix.factors.prediction=TRUE)
+
+cv.logistic = crossval(learner = logistic.learner,
+                       task = trainTask_lrxgb, iters=10L,
+                       stratify = TRUE,
+                       measures = acc,
+                       show.info = FALSE)
+
+cv.logistic$aggr #measure model accuracy, used to measure the reliability of the classifier in the prediction of positive cases since it measures the correctness of returned results
+cv.logistic$measures.test
+
+log.model = mlr::train(logistic.learner, trainTask_lrxgb)
+getLearnerModel(log.model)
+
+log.pred = predict(log.model, testTask_lrxgb)
+
+pred.log = log.pred$data$prob.2
+
+```
+
+
+
+```{r randomForest fitting, include=FALSE, results='hide'}
+
+########################################################
+#                    use model refine                  #
+########################################################
+
+
+pred.var.rf = train_classif
+
+getParamSet("classif.randomForest")
+rf = makeLearner("classif.randomForest", 
+                 predict.type= 'response',
+                 par.vals = list(ntree=200, mtry=3),
+                 fix.factors.prediction = TRUE)
+rf$par.vals = list(importance=TRUE)
+
+rf_param = makeParamSet(
+  makeIntegerParam("ntree", lower = 100, upper= 3000),
+  makeIntegerParam("mtry", lower = 3, upper = 20),
+  makeIntegerParam("nodesize", lower = 10, upper = 50)
+)
+
+rancontrol = makeTuneControlRandom(maxit=10L)
+
+set_cv = makeResampleDesc("CV", iters = 3L)
+
+rf_tune = tuneParams(learner=rf, resampling=set_cv,
+                     task = trainTask, 
+                     par.set = rf_param,
+                     control = rancontrol,
+                     measures = acc
+)
+
+#use randomForest package for modelling 
+rf.fit = randomForest(train$GamewinTeam~.,
+                      data=pred.var.rf,
+                      ntree= rf_tune$x[[1]]  ,
+                      na.action=na.omit,
+                      nodesize= rf_tune$x[[3]])
+
+tt=train%>%dplyr::count(GamewinTeam) #dataframe class
+tt
+
+rf.fit.w = randomForest(train$GamewinTeam~.,
+                          data=pred.var.rf,
+                          ntree=rf_tune$x[[1]], 
+                          nodesize = rf_tune$x[[3]], 
+                          na.action=na.omit,
+                      sampsize = c(min(tt$n), mean(tt$n))
+)
+
+#Random Forest Scorediff modelling
+
+getParamSet("regr.randomForest")
+rf_score = makeLearner("regr.randomForest", 
+                 predict.type= 'response',
+                 par.vals = list(ntree=200, mtry=3),
+                 fix.factors.prediction = TRUE)
+
+rf_score$par.vals = list(importance=TRUE)
+
+rf_param_score = makeParamSet(
+  makeIntegerParam("ntree", lower = 100, upper= 3000),
+  makeIntegerParam("mtry", lower = 3, upper = 20),
+  makeIntegerParam("nodesize", lower = 10, upper = 50)
+)
+
+rancontrol_score = makeTuneControlRandom(maxit=10L)
+
+set_cv_score = makeResampleDesc("CV", iters = 3L)
+
+rf_tune_score = tuneParams(learner=rf_score, 
+                           resampling=set_cv_score,
+                     task = trainTask_reg, 
+                     par.set = rf_param_score,
+                     control = rancontrol_score,
+                     measures = mse
+)
+
+rf.tree_score = setHyperPars(rf_score, par.vals = rf_tune_score$x)
+rforest_score = mlr::train(rf.tree_score,trainTask_reg)
+getLearnerModel(rforest_score) 
+
+
+
+```
+
+```{r rf_pred, include=FALSE, results='hide'}
+
+pred.rf1= predict(rf.fit, newdata = test, type='vote') #type = 'response'
+
+pred.rf.w = predict(rf.fit.w, newdata=test, type='vote') 
+
+pred.rf = pred.rf.1
+
+pr.score = predict(rforest_score, testTask_reg)
+
+pred.rf.margin = pr.score$data$response
+
+
+```
+
+
+```{r support vector machine, message=FALSE, warning=FALSE, include=FALSE}
+
+
+#svm modelling
+
+getParamSet("classif.ksvm")
+ksvm = makeLearner("classif.ksvm", 
+                   predict.type = "response",
+                   fix.factors.prediction = TRUE)
+
+pssvm = makeParamSet(
+  makeDiscreteParam("C", values = 2^c(-8,-4,-2,0)),
+  makeDiscreteParam("sigma", values = 2^c(-8,-4,0,4))
+  )
+
+ctrl = makeTuneControlGrid()
+
+res = tuneParams(ksvm, task = trainTask, 
+                      resampling = set_cv,
+                      par.set = pssvm,
+                      control = ctrl, 
+                      measures=acc)
+
+res$y
+
+t.svm = setHyperPars(ksvm, par.vals = res$x)
+par.svm = mlr::train(ksvm, trainTask)
+predict.svm = predict(par.svm, testTask)
+
+pred.svm = predict.svm$data$response
+
+```
+
+
+```{r gradient boosting, include=FALSE}
+
+getParamSet("classif.gbm")
+g.gbm = makeLearner("classif.gbm",
+                    predict.type = 'prob',
+                    fix.factors.prediction=TRUE)
+
+rancontrol = makeTuneControlRandom(maxit = 10L)
+set_cv = makeResampleDesc("CV", iters=3L)
+
+gbm_par = makeParamSet(
+  makeDiscreteParam("distribution", values = "bernoulli"),
+  makeIntegerParam("n.trees", lower = 100, upper = 2000),
+  makeIntegerParam("interaction.depth", lower=2, upper=30),
+  makeIntegerParam("n.minobsinnode", lower = 2, upper=30),
+  makeNumericParam('shrinkage', lower = 0.01, upper =0.2)
+)
+
+
+tune_gbm = tuneParams(learner=g.gbm, task = trainTask_gbm,
+                      resampling = set_cv,
+                      measures=acc,
+                      par.set = gbm_par, control = rancontrol
+)
+
+tune_gbm$y
+final_gbm = setHyperPars(learner = g.gbm,
+                         par.vals = tune_gbm$x)
+to.gbm = mlr::train(final_gbm, trainTask_gbm)
+pr.gbm = predict(to.gbm, testTask_gbm)
+
+pred.gbm  = pr.gbm$data
+
+
+```
+
+```{r, include=FALSE}
+#if statment
+bet1= NULL
+
+#bet100% of stake
+for(i in seq(nrow(test))){
+
+if(
+    data.frame(pred.rf)$Team2[i] >=0.6 #0.7 #this metric is the best
+      & pred.nb[[i]]=="Team2" #4th
+      #& pred.log[i]>=0.6 #do not use this metric
+      & pred.svm[i] == "Team2"
+    & pred.gbm[[3]][i]>= 0.6#0.7 #2nd
+
+   )
+{
+  bet1[i] = "Team2"
+  print(c(as.character(test$Team2[[i]]), "bet on Team 2", round(pred.rf.margin[[i]],0)))
+  
+} else if (
+       data.frame(pred.rf)$Team1[i]>=0.6 #0.7
+        & pred.nb[[i]]=="Team1"
+        #& pred.log[i]<=0.4 #didn't perform well on 10.03.2018 test data
+      &pred.svm[i]=="Team1"
+      & pred.gbm[[4]][i]>=0.6 #0.3
+
+          )
+{
+  bet1[i] = "Team1"
+  print (c(as.character(test$Team1[[i]]),"bet on Team 1",
+           round(pred.rf.margin[[i]],0)))
+  } else{
+    bet1[i] = "do not bet"
+  print("do not bet")
+}
+}
+
+#bet50% of stake
+bet2 = as.data.frame(bet1)%>%dplyr::mutate(test$Team1, test$Team2, run = round(pred.rf.margin,0))
+
+```
+
+```{r output, include=FALSE, results='hide'}
+testoutput = select(test, DataType,  Team1,Team2,Date)%>% 
+  mutate( Index.pred =paste(test$Team1, test$Team2, test$Date, sep = ""),Preddate = Sys.Date()-1, p.rf.team1 = data.frame(pred.rf)$Team1, p.rf.team2 = data.frame(pred.rf)$Team2, p.glm = pred.log, nb= pred.nb, gbm =pred.gbm[[3]], runline = pred.rf.margin, bet.forecast = bet1, bet.forecast.runline = bet2$run)
+
+df.list = read.xlsx("nba.xlsx", sheet= 'Pred', colNames=TRUE)
+
+#df.list$Date = as.Date(df.list$Date,format = "DD.MM.YYYY", origin = "1899-12-30")
+df.list$Preddate = as.Date(df.list$Preddate, origin = "1899-12-30") # don't know why it's not reading in data correctly this time. worked okay for Raw
+
+df.list = mutate(df.list, p.rf.team1 = as.numeric(p.rf.team1), p.rf.team2 = as.numeric(p.rf.team2))
+
+#df = df.list # initial set-up do not run 
+df = bind_rows(df.list, testoutput)
+
+
+wb = loadWorkbook("nba.xlsx")
+writeData(wb,sheet="Pred", df, colNames=TRUE) #doesn't work if saved in excel table
+saveWorkbook(wb, "nba.xlsx",overwrite=TRUE)
+```
+
+
+```{r}
+#create sample size of training, validation, test set
+n = seq(nrow(train))
+tr = sample(n, size = length(n)*0.7, replace = FALSE)
+#cv = sample(n[-tr], size = length(n[-tr])*0.5, replace=FALSE)
+tt = n[-tr]
+
+# get data 
+tr.smp = train[tr,]
+#cv.smp = train[cv,]
+tt.smp = train[tt,]
+
+```
+
+```{r, include=FALSE, ref.label='randomForest fitting'}
+
+#rerun random forest using train subset only
+
+rf.tune = pred.var.rf[tr,]
+
+curve.d = matrix(ncol = 3, nrow = ncol(pred.var.rf)) # ncol turn to 4
+
+
+for (i in 1:ncol(rf.tune)){
+  d = select(rf.tune,seq(i))
+  rf.fit.d = randomForest(rf.tune$GamewinTeam~., data=d,ntree=581,na.action=na.omit,nodesize=45) #optimise hyperparameters through another error analysis (2nd)
+  #print(rf.fit.d)
+ pred.d = predict(rf.fit.d, newdata = tr.smp,type='response')
+ train.error.d = sum(pred.d!=tr.smp$GamewinTeam)/length(tr)
+ curve.d[i,1] = i
+ curve.d[i,2] = train.error.d   # in-sample training error
+ test.pred.d = predict(rf.fit.d, newdata = tt.smp, type = 'response')
+ test.error.d = sum(test.pred.d!=tt.smp$GamewinTeam)/length(tt)
+ curve.d[i,3] = test.error.d
+}
+
+curve.d = as.data.frame(curve.d[-1,]) #removed first row of missing value
+colnames(curve.d) = c("no of features", "train error", "test error")
+
+p = ggplot(curve.d, aes(curve.d$`no of features`))+
+  geom_line(aes(y=curve.d$`train error`), colour = "red")+
+  geom_line(aes(y=curve.d$`test error`), colour = "black")
+
+p
+
+
+model.tt = lm(curve.d$`test error`~poly(curve.d$`no of features`,2))
+summary(model.tt); plot(model.tt$fitted.values,type ="l")
+which(model.tt$fitted.values==min(model.tt$fitted.values))
+
+Save.image(file = 'error analysis.RData') # save all objects in R env
+
+#load(file ='error analysis.RData') # load all saved
+
+```
+
+
+```{r undersampling sampsize for rf}
+table(train$GamewinTeam)
+table(tr.smp$GamewinTeam)
+
+s.min = min(table(rf.tune$GamewinTeam))
+s.max = max(table(rf.tune$GamewinTeam))
+
+curve.s = matrix(ncol = 3, nrow = 10) # ncol turn to 3
+
+for (i in 1:10){
+j = seq(s.min, s.max,length.out= 10)
+    rf.fit.s = randomForest(GamewinTeam~., data=rf.tune,ntree=2000,na.action=na.omit,nodesize=50
+                ,sampsize = c(j[[1]], j[[i]])) #optimise hyperparameters through another error analysis (2nd)
+  #print(rf.fit.d)
+ pred.s = predict(rf.fit.d, newdata = tr.smp,type='response')
+ train.error.s = sum(pred.s!=tr.smp$GamewinTeam)/length(tr)
+ curve.s[i,1] = j[[i]]
+ curve.s[i,2] = train.error.s   # in-sample training error
+ test.pred.s = predict(rf.fit.s, newdata = tt.smp, type = 'response')
+ test.error.s = sum(test.pred.s!=tt.smp$GamewinTeam)/length(tt)
+ curve.s[i,3] = test.error.s
+}
+
+curve.s = as.data.frame(curve.s) #removed first row of missing value
+colnames(curve.s) = c("sampsize team2", "train error", "test error")
+
+s = ggplot(curve.s, aes(curve.s$`sampsize team2`))+
+  geom_line(aes(y=curve.s$`train error`), colour = "red")+
+  geom_line(aes(y=curve.s$`test error`), colour = "black")
+
+
+```
+
